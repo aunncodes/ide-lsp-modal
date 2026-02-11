@@ -2,15 +2,11 @@ import asyncio
 import json
 import pathlib
 from contextlib import AbstractAsyncContextManager
-from urllib.parse import urlparse, unquote
-
-import modal
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import time
 import signal
 import os
 import tempfile
-
 from modal import Image, App, asgi_app
 
 web_app = FastAPI()
