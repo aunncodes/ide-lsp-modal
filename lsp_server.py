@@ -1,5 +1,10 @@
 import asyncio
+import json
+import pathlib
 from contextlib import AbstractAsyncContextManager
+from urllib.parse import urlparse, unquote
+
+import modal
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import time
 import signal
@@ -13,7 +18,8 @@ app = App("lsp-server")
 
 image = (
     Image.debian_slim()
-    .apt_install("wget", "unzip")
+    .apt_install("wget", "unzip", "tar")
+    .pip_install("fastapi[standard]")
     .run_commands(
         "wget -nv https://nodejs.org/dist/v20.14.0/node-v20.14.0-linux-x64.tar.xz",
         "tar -xf node-v20.14.0-linux-x64.tar.xz",
@@ -32,10 +38,33 @@ image = (
         "mv clangd_18.1.3/bin/clangd /usr/bin",
         "mv clangd_18.1.3/lib/clang /usr/lib/clang",
     )
+    .run_commands(
+        "mkdir -p /opt/java",
+        "wget -nv https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.10%2B7/OpenJDK21U-jdk_x64_linux_hotspot_21.0.10_7.tar.gz -O /tmp/jdk21.tar.gz",
+        "tar -xzf /tmp/jdk21.tar.gz -C /opt/java",
+        "rm /tmp/jdk21.tar.gz",
+        "ln -sf /opt/java/jdk-21*/bin/java /usr/local/bin/java",
+        "ln -sf /opt/java/jdk-21*/bin/javac /usr/local/bin/javac",
+        "mkdir -p /opt/jdtls",
+        "wget -nv https://download.eclipse.org/jdtls/snapshots/jdt-language-server-latest.tar.gz -O /tmp/jdtls.tar.gz",
+        "tar -xzf /tmp/jdtls.tar.gz -C /opt/jdtls",
+        "rm /tmp/jdtls.tar.gz",
+    )
 )
 
 PYTHON_LANGSERVER = "/node-v20.14.0-linux-x64/bin/pyright-langserver --stdio"
 CLANGD_LANGSERVER = "clangd --log=error --background-index=false --malloc-trim"
+JDTLS_BASE = (
+    "/usr/local/bin/java "
+    "-Declipse.application=org.eclipse.jdt.ls.core.id1 "
+    "-Dosgi.bundles.defaultStartLevel=4 "
+    "-Declipse.product=org.eclipse.jdt.ls.core.product "
+    "-Dlog.protocol=true "
+    "-Dlog.level=error "
+    "-Xms256m -Xmx1g "
+    "-jar /opt/jdtls/plugins/org.eclipse.equinox.launcher_*.jar "
+    "-configuration /opt/jdtls/config_linux"
+)
 
 
 class LSPExited(Exception):
@@ -54,10 +83,18 @@ class LanguageServerProcess(AbstractAsyncContextManager):
     _proc: asyncio.subprocess.Process
     _tmpdir: tempfile.TemporaryDirectory | None
 
-    def __init__(self, command: str, compiler_options: str | None = None):
+    def __init__(self, command: str, compiler_options: str | None = None, mode: str | None = None):
         self._command = command
         self._compiler_options = compiler_options
         self._tmpdir = None
+        self._mode = mode
+
+        self._jdtls_data = None
+        self._jdtls_project = None
+        self._jdtls_main_path = None
+        self._jdtls_root_uri = None
+        self._jdtls_real_uri = None
+        self._jdtls_client_uri = "file:///workspace/main.java"
 
     async def __aenter__(self):
         if self._compiler_options is not None:
@@ -67,11 +104,23 @@ class LanguageServerProcess(AbstractAsyncContextManager):
                 f.write("\n".join(self._compiler_options.split()))
             self._command = self._command + " --compile-commands-dir=" + self._tmpdir.name
 
+        if self._mode == "jdtls":
+            self._jdtls_data = tempfile.TemporaryDirectory(prefix="jdtls-data-")
+            self._jdtls_project = tempfile.TemporaryDirectory(prefix="jdtls-project-")
+
+            self._jdtls_main_path = os.path.join(self._jdtls_project.name, "Main.java")
+            open(self._jdtls_main_path, "w", encoding="utf-8").close()
+
+            self._jdtls_root_uri = pathlib.Path(self._jdtls_project.name).absolute().as_uri()
+            self._jdtls_real_uri = pathlib.Path(self._jdtls_main_path).absolute().as_uri()
+
+            self._command = self._command + f" -data {self._jdtls_data.name}"
+
         self._proc = await asyncio.create_subprocess_shell(
             self._command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            preexec_fn=os.setsid,  # We want to set a session ID to kill child processes too
+            preexec_fn=os.setsid,
         )
         return self
 
@@ -79,12 +128,16 @@ class LanguageServerProcess(AbstractAsyncContextManager):
         if self._tmpdir is not None:
             self._tmpdir.cleanup()
 
+        if self._jdtls_project is not None:
+            self._jdtls_project.cleanup()
+        if self._jdtls_data is not None:
+            self._jdtls_data.cleanup()
+
         if self._proc.returncode is None:
             print("Process hasn't exited yet, killing")
             try:
                 os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
             except ProcessLookupError:
-                # The process probably died between the "if" statement and os.getpgid
                 pass
             returncode = await self._proc.wait()
             print(f"Process killed with exit code {returncode}")
@@ -140,27 +193,59 @@ class LanguageServerProcess(AbstractAsyncContextManager):
                 )
 
                 if len(done) == 0:
-                    # no activity for 5 minutes -- timeout
                     print("No activity after 5 minutes, closing connection")
-                    await websocket.close(
-                        reason="Inactive for 5 minutes, please refresh"
-                    )
+                    await websocket.close(reason="Inactive for 5 minutes, please refresh")
                     break
 
                 if ws_read in done:
                     data = ws_read.result()
+
+                    if self._mode == "jdtls":
+                        obj = json.loads(data)
+                        method = obj.get("method")
+
+                        if method == "initialize" and self._jdtls_root_uri:
+                            params = obj.setdefault("params", {})
+                            params["rootUri"] = self._jdtls_root_uri
+                            params["workspaceFolders"] = [{"uri": self._jdtls_root_uri, "name": "workspace"}]
+
+                        if self._jdtls_real_uri:
+                            data = json.dumps(obj).replace(self._jdtls_client_uri, self._jdtls_real_uri)
+                            obj = json.loads(data)
+
+                        if self._jdtls_main_path:
+                            if method == "textDocument/didOpen":
+                                td = (obj.get("params") or {}).get("textDocument") or {}
+                                text = td.get("text")
+                                if isinstance(text, str):
+                                    with open(self._jdtls_main_path, "w", encoding="utf-8") as f:
+                                        f.write(text)
+
+                            elif method == "textDocument/didChange":
+                                changes = ((obj.get("params") or {}).get("contentChanges")) or []
+                                if changes:
+                                    text = changes[-1].get("text")
+                                    if isinstance(text, str):
+                                        with open(self._jdtls_main_path, "w", encoding="utf-8") as f:
+                                            f.write(text)
+
+                        data = json.dumps(obj)
+
                     await self.send_msg(data)
                     n_messages_from_ws += 1
                     ws_read = asyncio.create_task(websocket.receive_text())
 
                 if proc_read in done:
                     output = proc_read.result()
+
+                    if self._mode == "jdtls" and self._jdtls_real_uri:
+                        output = output.replace(self._jdtls_real_uri, self._jdtls_client_uri)
+
                     await websocket.send_text(output)
                     n_messages_from_lsp += 1
                     proc_read = asyncio.create_task(self.read_msg())
 
                 if last_log_time + 60 < time.time():
-                    # Every 60 seconds, log how many messages were sent
                     print(
                         f"In the last minute, {n_messages_from_lsp} messages were sent from the LSP and {n_messages_from_ws} messages were received from the websocket."
                     )
@@ -203,6 +288,13 @@ async def clangd_endpoint(websocket: WebSocket, compiler_options: str | None = N
         await lsp.connect_ws(websocket)
         print("Clangd websocket disconnected, stopping language server")
 
+@web_app.websocket("/jdtls")
+async def jdtls_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    async with LanguageServerProcess(JDTLS_BASE, mode="jdtls") as lsp:
+        print("Got jdtls connection!")
+        await lsp.connect_ws(websocket)
+        print("JDTLS websocket disconnected, stopping language server")
 
 @app.function(
     image=image,
