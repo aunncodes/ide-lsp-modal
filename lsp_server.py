@@ -7,7 +7,7 @@ import time
 import signal
 import os
 import tempfile
-from modal import Image, App, asgi_app
+from modal import Image, App, asgi_app, concurrent
 
 web_app = FastAPI()
 app = App("lsp-server")
@@ -329,8 +329,8 @@ async def jdtls_endpoint(websocket: WebSocket):
 @app.function(
     image=image,
     timeout=60 * 60 * 4,
-    allow_concurrent_inputs=20,
 )
+@concurrent(max_inputs=20)
 @asgi_app()
 def main():
     return web_app
