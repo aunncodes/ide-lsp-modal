@@ -1,15 +1,20 @@
-import asyncio
-import json
 import pathlib
-from contextlib import AbstractAsyncContextManager
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-import time
-import signal
-import os
-import tempfile
-from modal import Image, App, asgi_app, concurrent
 
-web_app = FastAPI()
+import modal
+from fastapi import FastAPI, WebSocket
+from modal import Image, App, asgi_app, concurrent
+from modal.mount import Mount
+
+from adapters.clangd import ClangdAdapter
+from adapters.default import DefaultAdapter
+from adapters.jdtls import JdtlsAdapter
+from lsp_process import LanguageServerProcess
+
+main_web_app = FastAPI()
+jdtls_web_app = FastAPI()
+
+ROOT = pathlib.Path(__file__).parent
+
 app = App("lsp-server")
 
 image = (
@@ -46,6 +51,10 @@ image = (
         "tar -xzf /tmp/jdtls.tar.gz -C /opt/jdtls",
         "rm /tmp/jdtls.tar.gz",
     )
+    .add_local_dir(
+        ROOT.as_posix(),
+        remote_path="/root"
+    )
 )
 
 PYTHON_LANGSERVER = "/node-v20.14.0-linux-x64/bin/pyright-langserver --stdio"
@@ -62,239 +71,8 @@ JDTLS_BASE = (
     "-configuration /opt/jdtls/config_linux"
 )
 
-class LSPExited(Exception):
-    pass
 
-
-class LanguageServerAdapter:
-    async def aenter(self) -> str:
-        raise NotImplementedError
-
-    async def aexit(self) -> None:
-        return None
-
-    async def ws_to_lsp(self, data: str) -> str:
-        return data
-
-    async def lsp_to_ws(self, data: str) -> str:
-        return data
-
-
-class DefaultAdapter(LanguageServerAdapter):
-    def __init__(self, command: str):
-        self._command = command
-
-    async def aenter(self) -> str:
-        return self._command
-
-
-class ClangdAdapter(LanguageServerAdapter):
-    def __init__(self, command: str, compiler_options: str | None = None):
-        self._command = command
-        self._compiler_options = compiler_options
-        self._tmpdir: tempfile.TemporaryDirectory | None = None
-
-    async def aenter(self) -> str:
-        if self._compiler_options is None:
-            return self._command
-        self._tmpdir = tempfile.TemporaryDirectory()
-        with open(self._tmpdir.name + "/compile_flags.txt", "w") as f:
-            f.write("\n".join(self._compiler_options.split()))
-        return self._command + " --compile-commands-dir=" + self._tmpdir.name
-
-    async def aexit(self) -> None:
-        if self._tmpdir is not None:
-            self._tmpdir.cleanup()
-            self._tmpdir = None
-
-
-class JdtlsAdapter(LanguageServerAdapter):
-    def __init__(self, command: str):
-        self._command = command
-        self._jdtls_data: tempfile.TemporaryDirectory | None = None
-        self._jdtls_project: tempfile.TemporaryDirectory | None = None
-        self._jdtls_main_path: str | None = None
-        self._jdtls_real_uri: str | None = None
-        self._jdtls_client_uri = "file:///workspace/main.java"
-
-    async def aenter(self) -> str:
-        self._jdtls_data = tempfile.TemporaryDirectory(prefix="jdtls-data-")
-        self._jdtls_project = tempfile.TemporaryDirectory(prefix="jdtls-project-")
-
-        self._jdtls_main_path = os.path.join(self._jdtls_project.name, "Main.java")
-        open(self._jdtls_main_path, "w", encoding="utf-8").close()
-
-        self._jdtls_real_uri = pathlib.Path(self._jdtls_main_path).absolute().as_uri()
-
-        return self._command + f" -data {self._jdtls_data.name}"
-
-    async def aexit(self) -> None:
-        if self._jdtls_project is not None:
-            self._jdtls_project.cleanup()
-        if self._jdtls_data is not None:
-            self._jdtls_data.cleanup()
-
-    async def ws_to_lsp(self, data: str) -> str:
-        obj = json.loads(data)
-        method = obj.get("method")
-
-        if method == "initialize":
-            params = obj["params"]
-            params["rootUri"] = pathlib.Path(self._jdtls_project.name).absolute().as_uri()
-            params["workspaceFolders"] = [{"uri": pathlib.Path(self._jdtls_project.name).absolute().as_uri(), "name": "workspace"}]
-
-        if self._jdtls_real_uri:
-            data = json.dumps(obj).replace(self._jdtls_client_uri, self._jdtls_real_uri)
-            obj = json.loads(data)
-
-        if self._jdtls_main_path:
-            if method == "textDocument/didOpen":
-                text = obj["params"]["textDocument"]["text"]
-                with open(self._jdtls_main_path, "w", encoding="utf-8") as f:
-                    f.write(text)
-
-            elif method == "textDocument/didChange":
-                text = obj["params"]["contentChanges"][-1]["text"]
-                with open(self._jdtls_main_path, "w", encoding="utf-8") as f:
-                    f.write(text)
-
-        return json.dumps(obj)
-
-    async def lsp_to_ws(self, data: str) -> str:
-        if self._jdtls_real_uri:
-            return data.replace(self._jdtls_real_uri, self._jdtls_client_uri)
-        return data
-
-
-class LanguageServerProcess(AbstractAsyncContextManager):
-    """Async context manager wrapper around a langauge server process.
-
-    Implements a (very basic) JSON-RPC / Microsoft Language Server protocol
-    through the process's stdin/stdout.
-
-    See: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/
-    """
-
-    _proc: asyncio.subprocess.Process
-
-    def __init__(self, adapter: LanguageServerAdapter):
-        self._adapter = adapter
-
-    async def __aenter__(self):
-        command = await self._adapter.aenter()
-        self._proc = await asyncio.create_subprocess_shell(
-            command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            preexec_fn=os.setsid,
-        )
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        try:
-            if self._proc.returncode is None:
-                print("Process hasn't exited yet, killing")
-                try:
-                    os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                returncode = await self._proc.wait()
-                print(f"Process killed with exit code {returncode}")
-            else:
-                print("Process has already exited, not killing")
-        finally:
-            await self._adapter.aexit()
-
-    async def read_msg(self) -> str:
-        assert self._proc.stdout is not None
-
-        # Read Content-Length: ...\r\n
-        output = await self._proc.stdout.readline()
-        if output == b"":
-            raise LSPExited()
-        output = output.decode("ascii")
-        if not output.startswith("Content-Length: "):
-            raise Exception(
-                f"Error: Expected output to start with `Content-Length: `, but got `{output.encode('ascii')}`"
-            )
-        content_len = int(output[len("Content-Length: ") :])
-
-        # Read \r\n
-        await self._proc.stdout.readexactly(2)
-
-        # Read message
-        output = await self._proc.stdout.readexactly(content_len)
-        return output.decode("utf-8")
-
-    async def send_msg(self, msg: str):
-        assert self._proc.stdin is not None
-
-        # Write Header
-        data = bytes(msg, "utf-8")
-        self._proc.stdin.write(bytes(f"Content-Length: {len(data)}\r\n\r\n", "ascii"))
-
-        # Write data
-        self._proc.stdin.write(data)
-        await self._proc.stdin.drain()
-
-    async def connect_ws(self, websocket: WebSocket):
-        ws_read = asyncio.create_task(websocket.receive_text())
-        proc_read = asyncio.create_task(self.read_msg())
-
-        last_log_time = time.time()
-        n_messages_from_ws = 0
-        n_messages_from_lsp = 0
-
-        try:
-            while True:
-                done, _pending = await asyncio.wait(
-                    [ws_read, proc_read],
-                    return_when=asyncio.FIRST_COMPLETED,
-                    timeout=5 * 60,
-                )
-
-                if len(done) == 0:
-                    print("No activity after 5 minutes, closing connection")
-                    await websocket.close(reason="Inactive for 5 minutes, please refresh")
-                    break
-
-                if ws_read in done:
-                    data = ws_read.result()
-                    data = await self._adapter.ws_to_lsp(data)
-
-                    await self.send_msg(data)
-                    n_messages_from_ws += 1
-                    ws_read = asyncio.create_task(websocket.receive_text())
-
-                if proc_read in done:
-                    output = proc_read.result()
-                    output = await self._adapter.lsp_to_ws(output)
-
-                    await websocket.send_text(output)
-                    n_messages_from_lsp += 1
-                    proc_read = asyncio.create_task(self.read_msg())
-
-                if last_log_time + 60 < time.time():
-                    print(
-                        f"In the last minute, {n_messages_from_lsp} messages were sent from the LSP and {n_messages_from_ws} messages were received from the websocket."
-                    )
-                    n_messages_from_lsp = 0
-                    n_messages_from_ws = 0
-                    last_log_time = time.time()
-        except WebSocketDisconnect:
-            pass
-        except LSPExited:
-            pass
-        except KeyboardInterrupt:
-            # preempted -- just disconnect the user
-            print("Server preempted -- closing connection")
-            await websocket.close(reason="Server closed, please refresh")
-        finally:
-            ws_read.cancel()
-            proc_read.cancel()
-
-
-@web_app.websocket("/pyright")
+@main_web_app.websocket("/pyright")
 async def pyright_endpoint(websocket: WebSocket):
     await websocket.accept()
 
@@ -308,17 +86,19 @@ async def pyright_endpoint(websocket: WebSocket):
         print("Pyright websocket disconnected, stopping language server")
 
 
-@web_app.websocket("/clangd")
+@main_web_app.websocket("/clangd")
 async def clangd_endpoint(websocket: WebSocket, compiler_options: str | None = None):
     await websocket.accept()
 
-    async with LanguageServerProcess(ClangdAdapter(CLANGD_LANGSERVER, compiler_options=compiler_options)) as lsp:
+    async with LanguageServerProcess(
+        ClangdAdapter(CLANGD_LANGSERVER, compiler_options=compiler_options)
+    ) as lsp:
         print(f"Got clangd connection with options `{compiler_options}`")
         await lsp.connect_ws(websocket)
         print("Clangd websocket disconnected, stopping language server")
 
 
-@web_app.websocket("/jdtls")
+@jdtls_web_app.websocket("/jdtls")
 async def jdtls_endpoint(websocket: WebSocket):
     await websocket.accept()
     async with LanguageServerProcess(JdtlsAdapter(JDTLS_BASE)) as lsp:
@@ -326,11 +106,25 @@ async def jdtls_endpoint(websocket: WebSocket):
         await lsp.connect_ws(websocket)
         print("JDTLS websocket disconnected, stopping language server")
 
+
 @app.function(
     image=image,
-    timeout=60 * 60 * 4,
+    timeout=60 * 60,
 )
 @concurrent(max_inputs=20)
 @asgi_app()
 def main():
-    return web_app
+    return main_web_app
+
+
+@app.function(
+    image=image,
+    timeout=60 * 60,
+    single_use_containers=True,
+    memory=1024,
+    cpu=1,
+    scaledown_window=60 * 60,
+)
+@asgi_app()
+def jdtls():
+    return jdtls_web_app
