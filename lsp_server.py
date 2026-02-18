@@ -1,10 +1,6 @@
 import pathlib
-
-import modal
 from fastapi import FastAPI, WebSocket
 from modal import Image, App, asgi_app, concurrent
-from modal.mount import Mount
-
 from adapters.clangd import ClangdAdapter
 from adapters.default import DefaultAdapter
 from adapters.jdtls import JdtlsAdapter
