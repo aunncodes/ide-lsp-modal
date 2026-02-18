@@ -62,9 +62,108 @@ JDTLS_BASE = (
     "-configuration /opt/jdtls/config_linux"
 )
 
-
 class LSPExited(Exception):
     pass
+
+
+class LanguageServerAdapter:
+    async def aenter(self) -> str:
+        raise NotImplementedError
+
+    async def aexit(self) -> None:
+        return None
+
+    async def ws_to_lsp(self, data: str) -> str:
+        return data
+
+    async def lsp_to_ws(self, data: str) -> str:
+        return data
+
+
+class DefaultAdapter(LanguageServerAdapter):
+    def __init__(self, command: str):
+        self._command = command
+
+    async def aenter(self) -> str:
+        return self._command
+
+
+class ClangdAdapter(LanguageServerAdapter):
+    def __init__(self, command: str, compiler_options: str | None = None):
+        self._command = command
+        self._compiler_options = compiler_options
+        self._tmpdir: tempfile.TemporaryDirectory | None = None
+
+    async def aenter(self) -> str:
+        if self._compiler_options is None:
+            return self._command
+        self._tmpdir = tempfile.TemporaryDirectory()
+        with open(self._tmpdir.name + "/compile_flags.txt", "w") as f:
+            f.write("\n".join(self._compiler_options.split()))
+        return self._command + " --compile-commands-dir=" + self._tmpdir.name
+
+    async def aexit(self) -> None:
+        if self._tmpdir is not None:
+            self._tmpdir.cleanup()
+            self._tmpdir = None
+
+
+class JdtlsAdapter(LanguageServerAdapter):
+    def __init__(self, command: str):
+        self._command = command
+        self._jdtls_data: tempfile.TemporaryDirectory | None = None
+        self._jdtls_project: tempfile.TemporaryDirectory | None = None
+        self._jdtls_main_path: str | None = None
+        self._jdtls_real_uri: str | None = None
+        self._jdtls_client_uri = "file:///workspace/main.java"
+
+    async def aenter(self) -> str:
+        self._jdtls_data = tempfile.TemporaryDirectory(prefix="jdtls-data-")
+        self._jdtls_project = tempfile.TemporaryDirectory(prefix="jdtls-project-")
+
+        self._jdtls_main_path = os.path.join(self._jdtls_project.name, "Main.java")
+        open(self._jdtls_main_path, "w", encoding="utf-8").close()
+
+        self._jdtls_real_uri = pathlib.Path(self._jdtls_main_path).absolute().as_uri()
+
+        return self._command + f" -data {self._jdtls_data.name}"
+
+    async def aexit(self) -> None:
+        if self._jdtls_project is not None:
+            self._jdtls_project.cleanup()
+        if self._jdtls_data is not None:
+            self._jdtls_data.cleanup()
+
+    async def ws_to_lsp(self, data: str) -> str:
+        obj = json.loads(data)
+        method = obj.get("method")
+
+        if method == "initialize":
+            params = obj["params"]
+            params["rootUri"] = pathlib.Path(self._jdtls_project.name).absolute().as_uri()
+            params["workspaceFolders"] = [{"uri": pathlib.Path(self._jdtls_project.name).absolute().as_uri(), "name": "workspace"}]
+
+        if self._jdtls_real_uri:
+            data = json.dumps(obj).replace(self._jdtls_client_uri, self._jdtls_real_uri)
+            obj = json.loads(data)
+
+        if self._jdtls_main_path:
+            if method == "textDocument/didOpen":
+                text = obj["params"]["textDocument"]["text"]
+                with open(self._jdtls_main_path, "w", encoding="utf-8") as f:
+                    f.write(text)
+
+            elif method == "textDocument/didChange":
+                text = obj["params"]["contentChanges"][-1]["text"]
+                with open(self._jdtls_main_path, "w", encoding="utf-8") as f:
+                    f.write(text)
+
+        return json.dumps(obj)
+
+    async def lsp_to_ws(self, data: str) -> str:
+        if self._jdtls_real_uri:
+            return data.replace(self._jdtls_real_uri, self._jdtls_client_uri)
+        return data
 
 
 class LanguageServerProcess(AbstractAsyncContextManager):
@@ -77,43 +176,14 @@ class LanguageServerProcess(AbstractAsyncContextManager):
     """
 
     _proc: asyncio.subprocess.Process
-    _tmpdir: tempfile.TemporaryDirectory | None
 
-    def __init__(self, command: str, compiler_options: str | None = None, mode: str | None = None):
-        self._command = command
-        self._compiler_options = compiler_options
-        self._tmpdir = None
-        self._mode = mode
-
-        self._jdtls_data = None
-        self._jdtls_project = None
-        self._jdtls_main_path = None
-        self._jdtls_root_uri = None
-        self._jdtls_real_uri = None
-        self._jdtls_client_uri = "file:///workspace/main.java"
+    def __init__(self, adapter: LanguageServerAdapter):
+        self._adapter = adapter
 
     async def __aenter__(self):
-        if self._compiler_options is not None:
-            self._tmpdir = tempfile.TemporaryDirectory()
-            assert self._command == CLANGD_LANGSERVER, "Only clangd language server supports compile flags right now!"
-            with open(self._tmpdir.name + "/compile_flags.txt", "w") as f:
-                f.write("\n".join(self._compiler_options.split()))
-            self._command = self._command + " --compile-commands-dir=" + self._tmpdir.name
-
-        if self._mode == "jdtls":
-            self._jdtls_data = tempfile.TemporaryDirectory(prefix="jdtls-data-")
-            self._jdtls_project = tempfile.TemporaryDirectory(prefix="jdtls-project-")
-
-            self._jdtls_main_path = os.path.join(self._jdtls_project.name, "Main.java")
-            open(self._jdtls_main_path, "w", encoding="utf-8").close()
-
-            self._jdtls_root_uri = pathlib.Path(self._jdtls_project.name).absolute().as_uri()
-            self._jdtls_real_uri = pathlib.Path(self._jdtls_main_path).absolute().as_uri()
-
-            self._command = self._command + f" -data {self._jdtls_data.name}"
-
+        command = await self._adapter.aenter()
         self._proc = await asyncio.create_subprocess_shell(
-            self._command,
+            command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             preexec_fn=os.setsid,
@@ -121,24 +191,19 @@ class LanguageServerProcess(AbstractAsyncContextManager):
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        if self._tmpdir is not None:
-            self._tmpdir.cleanup()
-
-        if self._jdtls_project is not None:
-            self._jdtls_project.cleanup()
-        if self._jdtls_data is not None:
-            self._jdtls_data.cleanup()
-
-        if self._proc.returncode is None:
-            print("Process hasn't exited yet, killing")
-            try:
-                os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            returncode = await self._proc.wait()
-            print(f"Process killed with exit code {returncode}")
-        else:
-            print("Process has already exited, not killing")
+        try:
+            if self._proc.returncode is None:
+                print("Process hasn't exited yet, killing")
+                try:
+                    os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                returncode = await self._proc.wait()
+                print(f"Process killed with exit code {returncode}")
+            else:
+                print("Process has already exited, not killing")
+        finally:
+            await self._adapter.aexit()
 
     async def read_msg(self) -> str:
         assert self._proc.stdout is not None
@@ -195,37 +260,7 @@ class LanguageServerProcess(AbstractAsyncContextManager):
 
                 if ws_read in done:
                     data = ws_read.result()
-
-                    if self._mode == "jdtls":
-                        obj = json.loads(data)
-                        method = obj.get("method")
-
-                        if method == "initialize" and self._jdtls_root_uri:
-                            params = obj.setdefault("params", {})
-                            params["rootUri"] = self._jdtls_root_uri
-                            params["workspaceFolders"] = [{"uri": self._jdtls_root_uri, "name": "workspace"}]
-
-                        if self._jdtls_real_uri:
-                            data = json.dumps(obj).replace(self._jdtls_client_uri, self._jdtls_real_uri)
-                            obj = json.loads(data)
-
-                        if self._jdtls_main_path:
-                            if method == "textDocument/didOpen":
-                                td = (obj.get("params") or {}).get("textDocument") or {}
-                                text = td.get("text")
-                                if isinstance(text, str):
-                                    with open(self._jdtls_main_path, "w", encoding="utf-8") as f:
-                                        f.write(text)
-
-                            elif method == "textDocument/didChange":
-                                changes = ((obj.get("params") or {}).get("contentChanges")) or []
-                                if changes:
-                                    text = changes[-1].get("text")
-                                    if isinstance(text, str):
-                                        with open(self._jdtls_main_path, "w", encoding="utf-8") as f:
-                                            f.write(text)
-
-                        data = json.dumps(obj)
+                    data = await self._adapter.ws_to_lsp(data)
 
                     await self.send_msg(data)
                     n_messages_from_ws += 1
@@ -233,9 +268,7 @@ class LanguageServerProcess(AbstractAsyncContextManager):
 
                 if proc_read in done:
                     output = proc_read.result()
-
-                    if self._mode == "jdtls" and self._jdtls_real_uri:
-                        output = output.replace(self._jdtls_real_uri, self._jdtls_client_uri)
+                    output = await self._adapter.lsp_to_ws(output)
 
                     await websocket.send_text(output)
                     n_messages_from_lsp += 1
@@ -265,7 +298,7 @@ class LanguageServerProcess(AbstractAsyncContextManager):
 async def pyright_endpoint(websocket: WebSocket):
     await websocket.accept()
 
-    async with LanguageServerProcess(PYTHON_LANGSERVER) as lsp:
+    async with LanguageServerProcess(DefaultAdapter(PYTHON_LANGSERVER)) as lsp:
         # read first two initialization messages
         for _ in range(2):
             await lsp.read_msg()
@@ -279,15 +312,16 @@ async def pyright_endpoint(websocket: WebSocket):
 async def clangd_endpoint(websocket: WebSocket, compiler_options: str | None = None):
     await websocket.accept()
 
-    async with LanguageServerProcess(CLANGD_LANGSERVER, compiler_options=compiler_options) as lsp:
+    async with LanguageServerProcess(ClangdAdapter(CLANGD_LANGSERVER, compiler_options=compiler_options)) as lsp:
         print(f"Got clangd connection with options `{compiler_options}`")
         await lsp.connect_ws(websocket)
         print("Clangd websocket disconnected, stopping language server")
 
+
 @web_app.websocket("/jdtls")
 async def jdtls_endpoint(websocket: WebSocket):
     await websocket.accept()
-    async with LanguageServerProcess(JDTLS_BASE, mode="jdtls") as lsp:
+    async with LanguageServerProcess(JdtlsAdapter(JDTLS_BASE)) as lsp:
         print("Got jdtls connection!")
         await lsp.connect_ws(websocket)
         print("JDTLS websocket disconnected, stopping language server")
