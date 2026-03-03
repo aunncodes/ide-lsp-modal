@@ -1,6 +1,7 @@
 import pathlib
 from fastapi import FastAPI, WebSocket
-from modal import Image, App, asgi_app, concurrent
+from modal import Image, App, asgi_app
+import modal
 from adapters.clangd import ClangdAdapter
 from adapters.default import DefaultAdapter
 from adapters.jdtls import JdtlsAdapter
@@ -107,7 +108,7 @@ async def jdtls_endpoint(websocket: WebSocket):
     image=image,
     timeout=60 * 60,
 )
-@concurrent(max_inputs=20)
+@modal.concurrent(max_inputs=20)
 @asgi_app()
 def main():
     return main_web_app
@@ -116,11 +117,8 @@ def main():
 @app.function(
     image=image,
     timeout=60 * 60,
-    single_use_containers=True,
-    memory=1024,
-    cpu=1,
-    scaledown_window=60 * 60,
 )
+@modal.concurrent(max_inputs=3)
 @asgi_app()
 def jdtls():
     return jdtls_web_app
