@@ -1,7 +1,7 @@
 import pathlib
 from fastapi import FastAPI, WebSocket
-from modal import Image, App, asgi_app
 import modal
+from modal import Image, App, asgi_app
 from adapters.clangd import ClangdAdapter
 from adapters.default import DefaultAdapter
 from adapters.jdtls import JdtlsAdapter
@@ -49,7 +49,7 @@ image = (
         "rm /tmp/jdtls.tar.gz",
     )
     .add_local_dir(
-        ROOT.as_posix(),
+        ROOT,
         remote_path="/root"
     )
 )
@@ -57,13 +57,9 @@ image = (
 PYTHON_LANGSERVER = "/node-v20.14.0-linux-x64/bin/pyright-langserver --stdio"
 CLANGD_LANGSERVER = "clangd --log=error --background-index=false --malloc-trim"
 JDTLS_BASE = (
-    "/usr/local/bin/java "
+    "java "
     "-Declipse.application=org.eclipse.jdt.ls.core.id1 "
-    "-Dosgi.bundles.defaultStartLevel=4 "
     "-Declipse.product=org.eclipse.jdt.ls.core.product "
-    "-Dlog.protocol=true "
-    "-Dlog.level=error "
-    "-Xms256m -Xmx1g "
     "-jar /opt/jdtls/plugins/org.eclipse.equinox.launcher_*.jar "
     "-configuration /opt/jdtls/config_linux"
 )
