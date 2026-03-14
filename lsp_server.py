@@ -1,4 +1,3 @@
-import pathlib
 from fastapi import FastAPI, WebSocket
 import modal
 from modal import Image, App, asgi_app
@@ -7,11 +6,7 @@ from adapters.default import DefaultAdapter
 from adapters.jdtls import JdtlsAdapter
 from lsp_process import LanguageServerProcess
 
-main_web_app = FastAPI()
-jdtls_web_app = FastAPI()
-
-ROOT = pathlib.Path(__file__).parent
-
+web_app = FastAPI()
 app = App("lsp-server")
 
 image = (
@@ -48,10 +43,9 @@ image = (
         "tar -xzf /tmp/jdtls.tar.gz -C /opt/jdtls",
         "rm /tmp/jdtls.tar.gz",
     )
-    .add_local_dir(
-        ROOT,
-        remote_path="/root"
-    )
+    .add_local_dir("adapters", remote_path="/root/adapters")
+    .add_local_file("lsp_process.py", remote_path="/root/lsp_process.py")
+    .add_local_file("jdtls_templates.py", remote_path="/root/jdtls_templates.py")
 )
 
 PYTHON_LANGSERVER = "/node-v20.14.0-linux-x64/bin/pyright-langserver --stdio"
@@ -65,7 +59,7 @@ JDTLS_BASE = (
 )
 
 
-@main_web_app.websocket("/pyright")
+@web_app.websocket("/pyright")
 async def pyright_endpoint(websocket: WebSocket):
     await websocket.accept()
 
@@ -79,7 +73,7 @@ async def pyright_endpoint(websocket: WebSocket):
         print("Pyright websocket disconnected, stopping language server")
 
 
-@main_web_app.websocket("/clangd")
+@web_app.websocket("/clangd")
 async def clangd_endpoint(websocket: WebSocket, compiler_options: str | None = None):
     await websocket.accept()
 
@@ -91,7 +85,7 @@ async def clangd_endpoint(websocket: WebSocket, compiler_options: str | None = N
         print("Clangd websocket disconnected, stopping language server")
 
 
-@jdtls_web_app.websocket("/jdtls")
+@web_app.websocket("/jdtls")
 async def jdtls_endpoint(websocket: WebSocket):
     await websocket.accept()
     async with LanguageServerProcess(JdtlsAdapter(JDTLS_BASE)) as lsp:
@@ -102,19 +96,9 @@ async def jdtls_endpoint(websocket: WebSocket):
 
 @app.function(
     image=image,
-    timeout=60 * 60,
+    timeout=60*60*4
 )
 @modal.concurrent(max_inputs=20)
 @asgi_app()
 def main():
-    return main_web_app
-
-
-@app.function(
-    image=image,
-    timeout=60 * 60,
-)
-@modal.concurrent(max_inputs=3)
-@asgi_app()
-def jdtls():
-    return jdtls_web_app
+    return web_app

@@ -28,6 +28,35 @@ class JdtlsAdapter(LanguageServerAdapter):
     async def aexit(self) -> None:
         self._jdtls_data.cleanup()
 
+    def _safe_replace(self, obj: dict, old: str, new: str) -> str:
+        params = obj.get("params")
+        did_open_text = None
+        did_change_texts = None
+
+        if params:
+            text_document = params.get("textDocument")
+            if text_document and "text" in text_document:
+                did_open_text = text_document.pop("text")
+
+            content_changes = params.get("contentChanges")
+            if content_changes:
+                did_change_texts = [change.pop("text", None) for change in content_changes]
+
+        data = json.dumps(obj).replace(old, new)
+        obj = json.loads(data)
+
+        params = obj.get("params")
+        if params:
+            if did_open_text is not None:
+                params["textDocument"]["text"] = did_open_text
+
+            if did_change_texts is not None:
+                for change, original_text in zip(params["contentChanges"], did_change_texts):
+                    if original_text is not None:
+                        change["text"] = original_text
+
+        return json.dumps(obj)
+
     async def ws_to_lsp(self, data: str) -> str:
         obj = json.loads(data)
 
@@ -38,11 +67,13 @@ class JdtlsAdapter(LanguageServerAdapter):
             params["workspaceFolders"] = [{"uri": workspace_uri, "name": "workspace"}]
 
         if self._jdtls_real_uri:
-            return json.dumps(obj).replace(self._jdtls_client_uri, self._jdtls_real_uri)
+            return self._safe_replace(obj, self._jdtls_client_uri, self._jdtls_real_uri)
 
         return json.dumps(obj)
 
     async def lsp_to_ws(self, data: str) -> str:
         if self._jdtls_real_uri:
-            return data.replace(self._jdtls_real_uri, self._jdtls_client_uri)
+            obj = json.loads(data)
+            return self._safe_replace(obj, self._jdtls_real_uri, self._jdtls_client_uri)
+
         return data
