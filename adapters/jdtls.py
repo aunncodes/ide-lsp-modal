@@ -26,7 +26,9 @@ class JdtlsAdapter(LanguageServerAdapter):
         return self._command + f" -data {self._jdtls_data.name}"
 
     async def aexit(self) -> None:
-        self._jdtls_data.cleanup()
+        if self._jdtls_data is not None:
+            self._jdtls_data.cleanup()
+            self._jdtls_data = None
 
     def _safe_replace(self, obj: dict, old: str, new: str) -> str:
         params = obj.get("params")
